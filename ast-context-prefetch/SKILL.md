@@ -253,9 +253,11 @@ MAX_PREFETCH_CHARS = 200_000  # 约 5-8 万 tokens
 # 4. 字符计数；超限即停并输出 "... (Context prefetch limits reached)"
 ```
 
-### Step 8 — 注入 system prompt
+### Step 8 — 注入 system prompt 并落盘到 Markdown
 
-将预取输出包裹在明确分隔的块中，并告知 LLM 这是起点而非穷尽：
+将预取输出包裹在明确分隔的块中，并告知 LLM 这是起点而非穷尽；**同时将结果落盘到 `.md` 文件**，供审计、重跑、人工 review 复用。
+
+#### 8.1 注入 system prompt
 
 ```
 <pre_fetched_context>
@@ -265,6 +267,52 @@ MAX_PREFETCH_CHARS = 200_000  # 约 5-8 万 tokens
 {prefetched}
 </pre_fetched_context>
 ```
+
+#### 8.2 落盘 Markdown 文件（推荐始终启用）
+
+> **动机**：LLM 工具调用输出不可持久，遇到审查中断、回溯调试、多人协作对比时容易丢；Markdown 文件可直接在 IDE/GitHub 中浏览，也能作为 pipeline 的可复用产物。
+
+**CLI 用法**：新增可选参数 `--md <path>`
+
+```bash
+# 1) 仅 stdout（兼容老脚本，默认行为不变）
+python prefetch.py /path/to/worktree patch.diff
+
+# 2) stdout + 落盘到指定 md 文件
+#    同时自动把原始 diff 保存到同目录同名 .diff 文件
+python prefetch.py /path/to/worktree patch.diff --md prefetched_context.md
+#    产物: prefetched_context.md  +  prefetched_context.diff
+
+# 3) 管道 + md 落盘
+git -C /path/to/worktree show HEAD \
+  | python prefetch.py /path/to/worktree - --md prefetched_context.md
+```
+
+> **diff 文件命名规则**：`<md_path 的 stem>.diff`（即把 `--md` 指定路径的扩展名替换为 `.diff`）。原始 diff 单独落盘便于审计、重跑、人工对比，避免从 git 历史回溯。
+
+**Markdown 文件结构**（固定三段，便于程序化消费和人类阅读）：
+
+```markdown
+# Prefetched Context
+
+## Summary
+- Worktree: `/path/to/worktree`
+- Generated: `YYYY-MM-DD HH:MM:SS`
+- Symbols looked up: `N`
+- Blocks rendered: `M`
+- Output chars: `X` / `MAX_PREFETCH_CHARS`
+- Truncated: `yes | no`
+
+## Context (可直接复制粘贴到 `<pre_fetched_context>` 块)
+
+{prefetched_plain_text}
+
+## Index（块索引，便于跳转到对应源码）
+1. `path:line` — `(symbol_name or <unnamed block>)`
+2. ...
+```
+
+**作为库调用**时，新增 `prefetch_context_to_md()` 包装函数，返回 `(plain_text, md_text)` 两元组，调用方自行决定写入何处；或直接复用底层 `render_markdown_report(worktree_path, diff, plain_text)`。
 
 ## 设计决策（及理由）
 

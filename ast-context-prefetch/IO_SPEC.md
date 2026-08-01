@@ -26,12 +26,17 @@
 ### CLI 入口
 
 ```bash
-python prefetch.py <worktree_path> <diff_file|->
+python prefetch.py <worktree_path> <diff_file|-> [--md <output.md>]
 # diff_file: 文件路径
 # -        : 从 stdin 读取
+# --md     : 可选，额外将 Markdown 报告写入指定文件（不影响 stdout）
 ```
 
 ## 三、输出详解
+
+输出分为两种形式：**纯文本 stdout**（默认）和 **Markdown 落盘**（`--md` 启用）。
+
+### 3.1 纯文本 stdout
 
 输出是一个**纯文本字符串**，由若干代码块组成，每块带 header：
 
@@ -57,6 +62,61 @@ struct my_struct {
 | 合并 | 相邻范围 gap ≤ 3 行自动合并 |
 | 截断 | 超 `MAX_PREFETCH_CHARS`(200K) 字符即停 |
 | 符号名 | 仅当该块恰好含 1 个定义时显示 |
+
+### 3.2 Markdown 落盘（--md <path>）
+
+当提供 `--md` 参数时，除 stdout 外额外写入一份 Markdown 文件，并自动把原始 diff 保存到相邻 `.diff` 文件。Markdown 文件结构固定三段，便于程序化消费和人类 review；diff 文件便于审计、重跑、人工对比。
+
+**文件命名规则**：
+
+| `--md` 参数 | 生成的 MD 文件 | 自动生成的 diff 文件 |
+|---|---|---|
+| `prefetched.md` | `prefetched.md` | `prefetched.diff` |
+| `prefetched_context.md` | `prefetched_context.md` | `prefetched_context.diff` |
+| `out/prefetched.txt` | `out/prefetched.txt` | `out/prefetched.diff` |
+
+> diff 文件路径 = `Path(md_path).with_suffix(".diff")`。
+
+```markdown
+# Prefetched Context
+
+## Summary
+- Worktree: `/path/to/worktree`
+- Generated: `YYYY-MM-DD HH:MM:SS`
+- Modified files: `N`
+  - `file1.c`
+  - `include/file2.h`
+- Symbols looked up: `M`
+- Blocks rendered: `K`
+- Output chars: `X` / `MAX_PREFETCH_CHARS`
+- Truncated: `yes | no`
+
+## Context (可直接复制粘贴到 `<pre_fetched_context>` 块)
+
+```
+--- path:line (name) ---
+<code block>
+...
+```
+
+## Index（块索引，便于跳转到对应源码）
+1. `path:start-end` — `(symbol_name or <unnamed block>)`
+2. ...
+```
+
+**渲染函数**：`render_markdown_report(worktree_path, diff, plain_text, meta)`
+
+**库调用包装**：`prefetch_context_to_md(worktree_path, diff)` → `(plain_text, md_text, meta)`
+
+**meta 字段说明**（同时作为库调用返回值的一部分）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `symbols_looked_up` | int | Phase 2 实际经 git grep 查找的符号数 |
+| `blocks` | list[tuple] | `(relative, start1, end1, name)` 列表 |
+| `truncated` | bool | 是否因字符预算而截断 |
+| `output_chars` | int | plain_text 的实际字符数 |
+| `modified_files` | list[str] | diff 命中的文件列表 |
 
 ## 四、输出的消费方式
 
@@ -94,10 +154,13 @@ diff (str)
   │   ├─ proximity_score            → 接近度分
   │   └─ best_definition_range      ──► (path, start, end)  ──► range_map
   │
-  └─ render_range_map(range_map) ──► 输出字符串 (str)
+  └─ render_range_map(range_map) ──► (plain_text, blocks, truncated)
+                                                      │
+                                                      ├─► stdout（纯文本）
+                                                      └─► render_markdown_report() ──► .md 文件（--md 参数）
 ```
 
 ## 六、一句话总结
 
 **输入**：git worktree 路径 + unified diff 文本
-**输出**：一段 ≤200K 字符的代码 context 字符串（含被 diff 触及的完整函数/结构体/类型定义），直接注入 LLM system prompt。
+**输出**：一段 ≤200K 字符的代码 context 字符串（含被 diff 触及的完整函数/结构体/类型定义），直接注入 LLM system prompt；可选同时落盘一份结构化 Markdown 报告（含 Summary、Context、Index 三段）。

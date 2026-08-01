@@ -8,8 +8,8 @@ ast_context_prefetch.py — 基于 tree-sitter 的动态 context 预取实现。
   Render:  修改文件优先、相邻合并、200K 字符预算
 
 用法:
-    python prefetch.py <worktree_path> <diff_file>
-    python prefetch.py <worktree_path> -        # 从 stdin 读取 diff
+    python prefetch.py <worktree_path> <diff_file> [--md <output.md>]
+    python prefetch.py <worktree_path> - [--md <output.md>]   # 从 stdin 读取 diff
 
 依赖:
     pip install 'tree-sitter>=0.23' 'tree-sitter-c>=0.21'
@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import sys
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 from typing import Optional
@@ -579,13 +580,19 @@ def render_range_map(
     range_map: dict[Path, set[tuple[int, int]]],
     worktree_path: Path,
     modified_files: dict[str, list[tuple[int, int]]],
-) -> str:
+) -> tuple[str, list[tuple[str, int, int, str]], bool]:
     """将收集到的行范围渲染为最终预取 context 字符串。
 
     修改文件优先渲染（接近预算上限时核心上下文不被截断）。
+
+    返回:
+        (output_text, blocks, truncated)
+            blocks 元素: (relative_path, start_line_1based, end_line_1based, symbol_or_unnamed)
     """
     output: list[str] = []
     current_chars = 0
+    blocks: list[tuple[str, int, int, str]] = []
+    truncated = False
 
     modified_paths = {worktree_path / f for f in modified_files}
 
@@ -619,6 +626,7 @@ def render_range_map(
                 name = next(iter(names))
                 header = f"--- {relative}:{start + 1} ({name}) ---\n"
             else:
+                name = "<unnamed block>"
                 header = f"--- {relative}:{start + 1} ---\n"
 
             if clamped_end >= start and start < len(lines):
@@ -628,14 +636,16 @@ def render_range_map(
 
             if current_chars + len(header) + len(block) + 1 > MAX_PREFETCH_CHARS:
                 output.append("\n... (Context prefetch limits reached)\n")
-                return "".join(output)
+                truncated = True
+                return "".join(output), blocks, truncated
 
             output.append(header)
             output.append(block)
             output.append("\n")
             current_chars += len(header) + len(block) + 1
+            blocks.append((relative, start + 1, clamped_end + 1, name))
 
-    return "".join(output)
+    return "".join(output), blocks, truncated
 
 
 # ---------------------------------------------------------------------------
@@ -643,11 +653,31 @@ def render_range_map(
 # ---------------------------------------------------------------------------
 
 def prefetch_context(worktree_path: Path, diff: str) -> str:
-    """从 diff 构建预取 context 字符串。
+    """从 diff 构建预取 context 字符串（向后兼容的简写入口）。
 
     两阶段流水线:
       Phase 1: 本地 AST 分析（修改文件内）
       Phase 2: 全局 git grep + AST 评分（跨文件定位真实定义）
+
+    说明: 本函数仅返回纯文本，保持与原签名兼容；
+          如需完整元数据或 Markdown，请直接调用 `prefetch_context_full`。
+    """
+    plain_text, _meta = prefetch_context_full(worktree_path, diff)
+    return plain_text
+
+
+def prefetch_context_full(
+    worktree_path: Path,
+    diff: str,
+) -> tuple[str, dict]:
+    """从 diff 构建预取 context，并返回 (plain_text, meta)。
+
+    meta 字段:
+        symbols_looked_up: int     Phase 2 实际 git grep 的符号数
+        blocks: list[tuple]        (relative, start1, end1, name)
+        truncated: bool            是否因字符预算截断
+        output_chars: int          plain_text 实际长度
+        modified_files: list[str]  diff 修改的文件名列表
     """
     worktree_path = Path(worktree_path)
     file_ranges = parse_diff_ranges(diff)
@@ -699,7 +729,7 @@ def prefetch_context(worktree_path: Path, diff: str) -> str:
         regex_pattern = (
             r"^((struct|enum|union)\s+({0})\b"
             r"|#define\s+({0})\b"
-            r"|([a-zA-Z_][a-zA-Z0-9_ \t*]+\s+)?({0})\s*\()"
+            r"|([a-zA-Z_][a-zA-Z0-9_ \t*]+\s*)?({0})\s*\()"
         ).format(sym_alt)
 
         # 调用者所在目录集合（用于接近度评分）
@@ -758,32 +788,142 @@ def prefetch_context(worktree_path: Path, diff: str) -> str:
                 range_map[path].add((start, end))
 
     # ---- 渲染输出 ----
-    return render_range_map(range_map, worktree_path, file_ranges)
+    plain_text, blocks, truncated = render_range_map(
+        range_map, worktree_path, file_ranges
+    )
+
+    meta = {
+        "symbols_looked_up": len(symbols),
+        "blocks": blocks,
+        "truncated": truncated,
+        "output_chars": len(plain_text),
+        "modified_files": list(file_ranges.keys()),
+    }
+    return plain_text, meta
+
+
+# ---------------------------------------------------------------------------
+# Markdown 报告渲染
+# ---------------------------------------------------------------------------
+
+def render_markdown_report(
+    worktree_path: Path,
+    diff: str,
+    plain_text: str,
+    meta: dict,
+) -> str:
+    """将预取结果渲染为 Markdown 报告字符串（Summary + Context + Index 三段）。
+
+    该字符串可直接写入 .md 文件。
+    """
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    symbols_n = meta.get("symbols_looked_up", 0)
+    blocks = meta.get("blocks", [])
+    truncated = meta.get("truncated", False)
+    output_chars = meta.get("output_chars", len(plain_text))
+    modified_files = meta.get("modified_files", [])
+
+    lines: list[str] = []
+    lines.append("# Prefetched Context")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append(f"- Worktree: `{worktree_path}`")
+    lines.append(f"- Generated: `{generated_at}`")
+    lines.append(f"- Modified files: `{len(modified_files)}`")
+    for mf in modified_files:
+        lines.append(f"  - `{mf}`")
+    lines.append(f"- Symbols looked up: `{symbols_n}`")
+    lines.append(f"- Blocks rendered: `{len(blocks)}`")
+    lines.append(f"- Output chars: `{output_chars}` / `{MAX_PREFETCH_CHARS}`")
+    lines.append(f"- Truncated: `{'yes' if truncated else 'no'}`")
+    lines.append("")
+    lines.append("## Context (可直接复制粘贴到 `<pre_fetched_context>` 块)")
+    lines.append("")
+    lines.append("```")
+    lines.append(plain_text.rstrip("\n"))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Index（块索引，便于跳转到对应源码）")
+    if blocks:
+        for i, (relative, start1, end1, name) in enumerate(blocks, 1):
+            if end1 == start1:
+                loc = f"{relative}:{start1}"
+            else:
+                loc = f"{relative}:{start1}-{end1}"
+            lines.append(f"{i}. `{loc}` — `{name}`")
+    else:
+        lines.append("_（无可用块）_")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def prefetch_context_to_md(worktree_path: Path, diff: str) -> tuple[str, str, dict]:
+    """库调用的便捷包装：返回 (plain_text, md_text, meta)。"""
+    plain_text, meta = prefetch_context_full(worktree_path, diff)
+    md_text = render_markdown_report(worktree_path, diff, plain_text, meta)
+    return plain_text, md_text, meta
 
 
 # ---------------------------------------------------------------------------
 # CLI 入口
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    if len(sys.argv) < 3:
+def _parse_args(argv: list[str]) -> tuple[str, str, Optional[str]]:
+    """极简参数解析（不引入 argparse 依赖，保持脚本轻量）。
+
+    返回: (worktree_str, diff_arg, md_path_or_None)
+    """
+    md_path: Optional[str] = None
+    positional: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--md":
+            if i + 1 >= len(argv):
+                print("错误: --md 需要一个输出文件路径", file=sys.stderr)
+                sys.exit(2)
+            md_path = argv[i + 1]
+            i += 2
+            continue
+        positional.append(a)
+        i += 1
+    if len(positional) < 2:
         print(
-            "用法: python prefetch.py <worktree_path> <diff_file|->\n"
-            "  diff_file: unified diff 文件路径，或 '-' 从 stdin 读取",
+            "用法: python prefetch.py <worktree_path> <diff_file|-> [--md <output.md>]\n"
+            "  diff_file: unified diff 文件路径，或 '-' 从 stdin 读取\n"
+            "  --md:      额外将 Markdown 报告写入指定文件",
             file=sys.stderr,
         )
         sys.exit(2)
+    return positional[0], positional[1], md_path
 
-    worktree = Path(sys.argv[1]).resolve()
-    diff_arg = sys.argv[2]
 
+def main() -> None:
+    worktree_str, diff_arg, md_path = _parse_args(sys.argv[1:])
+
+    worktree = Path(worktree_str).resolve()
     if diff_arg == "-":
         diff = sys.stdin.read()
     else:
         diff = Path(diff_arg).read_text(encoding="utf-8", errors="replace")
 
-    output = prefetch_context(worktree, diff)
-    sys.stdout.write(output)
+    plain_text, meta = prefetch_context_full(worktree, diff)
+    sys.stdout.write(plain_text)
+
+    if md_path:
+        md_text = render_markdown_report(worktree, diff, plain_text, meta)
+        Path(md_path).write_text(md_text, encoding="utf-8")
+        # 同时把原始 diff 保存到相邻 .diff 文件，便于回溯/审计/重跑
+        diff_path = Path(md_path).with_suffix(".diff")
+        diff_path.write_text(diff, encoding="utf-8")
+        print(
+            f"[prefetch] Markdown report written to: {Path(md_path).resolve()}",
+            file=sys.stderr,
+        )
+        print(
+            f"[prefetch] Diff saved to: {diff_path.resolve()}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
