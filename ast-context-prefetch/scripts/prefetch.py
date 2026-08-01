@@ -48,6 +48,13 @@ ADJACENT_RANGE_GAP = 10               # diff 行范围合并间距
 RENDER_RANGE_GAP = 3                  # 渲染时相邻范围合并间距
 MAX_FILES_PER_SYMBOL = 3              # 跨文件同分时最多展示的文件数（预算控制）
 
+# Phase 1.5: static 函数 caller 预取的预算控制
+# 仅对 static 函数生效（caller 必在同文件，数量天然可控）；
+# 非 static 函数的 caller 跨文件、可能成百上千，仍交 LLM 按需查。
+MAX_CALLERS_PER_STATIC_FN = 8      # 每个 static 函数最多抓的 caller 数
+CALLER_OVERSIZE_THRESHOLD = 100    # caller 超过此行数则截断
+CALLER_OVERSIZE_HALF_WINDOW = 50   # 截断时取调用点 ± 此行数
+
 # Phase 1 目标 AST 节点类型（顶层定义）
 TARGET_KINDS = {
     "function_definition",
@@ -331,6 +338,132 @@ def extract_called_functions(source: str, diff_ranges: list[tuple[int, int]]) ->
 
     collect(tree.root_node)
     return funcs
+
+
+# ---------------------------------------------------------------------------
+# Step 2.5: Phase 1.5 — static 函数的 caller 预取
+# ---------------------------------------------------------------------------
+#
+# 设计理由（与 Phase 2 git grep 的区别）：
+#   - static 函数的 caller 必然在同文件内（C 语言可见性保证），数量可控
+#   - 非 static 函数的 caller 跨文件、可能成百上千，仍交 LLM 按需查
+#
+# 补上两个盲区：
+#   1. caller 函数体 — 让 LLM 判断 caller 是否容忍 modified fn 的新行为
+#      （如新增的提前 return、新增的锁、改变的返回值契约）
+#   2. caller 传给 modified fn 的回调参数实现 — 函数指针调用盲区
+#      （extract_called_functions 跳过函数指针调用，只有从 caller 侧
+#       看参数才能发现回调函数名）
+
+
+def extract_modified_static_functions(
+    source: str, diff_ranges: list[tuple[int, int]]
+) -> list[tuple[str, int, int]]:
+    """返回与 diff 重叠的 static 函数定义 (name, start, end) 列表。
+
+    仅返回含 static 存储类说明符的 function_definition。
+    非 static 函数的 caller 跨文件、数量不可控，不在此阶段预取。
+    """
+    tree = _parse(source)
+    root = tree.root_node
+    results: list[tuple[str, int, int]] = []
+    for child in root.children:
+        if child.type != "function_definition":
+            continue
+        blk_start = _row(child.start_point)
+        blk_end = _row(child.end_point)
+        if not any(blk_start <= e and blk_end >= s for s, e in diff_ranges):
+            continue
+        if not has_static_storage(child):
+            continue
+        name = _function_name(child)
+        if name:
+            results.append((name, blk_start, blk_end))
+    return results
+
+
+def _collect_top_level_function_names(source: str) -> dict[str, tuple[int, int]]:
+    """收集文件内所有顶层函数定义的 {name: (start_row, end_row)}。
+
+    用于验证 caller 传给 modified fn 的参数是否是同文件函数名（回调）。
+    """
+    tree = _parse(source)
+    root = tree.root_node
+    result: dict[str, tuple[int, int]] = {}
+    for child in root.children:
+        if child.type != "function_definition":
+            continue
+        name = _function_name(child)
+        if name:
+            result[name] = (_row(child.start_point), _row(child.end_point))
+    return result
+
+
+def _extract_callback_args(call_node) -> list[str]:
+    """从 call_expression 的参数中提取函数指针参数名。
+
+    仅提取类型为 bare identifier 的参数（函数名直接作为参数传递）。
+    跳过 call_expression、string_literal、number 等非标识符参数。
+    调用方需在同文件函数表中验证这些标识符是否真是函数名。
+    """
+    args_node = call_node.child_by_field_name("arguments")
+    if args_node is None:
+        return []
+    callbacks: list[str] = []
+    for child in args_node.children:
+        if child.type == "identifier":
+            name = _text(child)
+            if len(name) >= 3 and name not in COMMON_C_WORDS:
+                callbacks.append(name)
+    return callbacks
+
+
+def find_callers_in_file(
+    source: str, target_fn: str
+) -> list[tuple[int, int, int, list[str]]]:
+    """在同文件内查找调用 target_fn 的函数（callers）。
+
+    返回 [(caller_start, caller_end, call_site_row, callback_args), ...]
+      - call_site_row: 调用 target_fn 的行号，用于过长 caller 截断定位
+      - callback_args: caller 传给 target_fn 的函数指针参数名列表
+
+    去重：同一 caller 多次调用 target_fn 只返回一次（取首个调用点）。
+    """
+    tree = _parse(source)
+    root = tree.root_node
+    raw: list[tuple[int, int, int, list[str]]] = []
+
+    def visit(node):
+        if node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            if (func is not None
+                    and func.type == "identifier"
+                    and _text(func) == target_fn):
+                # 向上找到包含此调用的最近 function_definition
+                caller_node = node
+                while (caller_node is not None
+                        and caller_node.type != "function_definition"):
+                    caller_node = caller_node.parent
+                if caller_node is not None:
+                    caller_start = _row(caller_node.start_point)
+                    caller_end = _row(caller_node.end_point)
+                    call_row = _row(node.start_point)
+                    callbacks = _extract_callback_args(node)
+                    raw.append((caller_start, caller_end, call_row, callbacks))
+        for child in node.children:
+            visit(child)
+
+    visit(root)
+
+    # 去重：同一 caller 函数只保留首次出现
+    seen: set[tuple[int, int]] = set()
+    unique: list[tuple[int, int, int, list[str]]] = []
+    for cs, ce, cr, cbs in raw:
+        key = (cs, ce)
+        if key not in seen:
+            seen.add(key)
+            unique.append((cs, ce, cr, cbs))
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +921,37 @@ def prefetch_context_full(
             already_extracted.update(extract_defined_names(content, start, end))
             symbols_to_lookup.update(extract_type_names(content, start, end))
         called_functions.update(extract_called_functions(content, ranges))
+
+        # ---- Phase 1.5: static 函数的 caller 预取 ----
+        # 仅对 static 函数生效（caller 必在同文件，数量可控）。
+        # 非 static 函数的 caller 跨文件、可能爆炸，仍交 LLM 按需查。
+        # 补两个盲区：caller 函数体 + caller 传给 modified fn 的回调实现。
+        static_fns = extract_modified_static_functions(content, ranges)
+        if static_fns:
+            all_fn_names = _collect_top_level_function_names(content)
+            for fn_name, _fn_start, _fn_end in static_fns:
+                callers = find_callers_in_file(content, fn_name)
+                for caller_start, caller_end, call_row, callbacks \
+                        in callers[:MAX_CALLERS_PER_STATIC_FN]:
+                    # 过长 caller 截断到调用点附近
+                    if caller_end - caller_start > CALLER_OVERSIZE_THRESHOLD:
+                        caller_start = max(
+                            0, call_row - CALLER_OVERSIZE_HALF_WINDOW
+                        )
+                        caller_end = min(
+                            caller_end, call_row + CALLER_OVERSIZE_HALF_WINDOW
+                        )
+                    range_map[file_path].add((caller_start, caller_end))
+                    # 抓回调参数实现（仅同文件函数，补函数指针调用盲区）
+                    for cb in callbacks:
+                        if cb in all_fn_names:
+                            cb_start, cb_end = all_fn_names[cb]
+                            if cb_end - cb_start > CALLER_OVERSIZE_THRESHOLD:
+                                cb_end = min(
+                                    cb_start + CALLER_OVERSIZE_THRESHOLD,
+                                    cb_end,
+                                )
+                            range_map[file_path].add((cb_start, cb_end))
 
     # 移除已在本地提取的符号
     symbols_to_lookup -= already_extracted

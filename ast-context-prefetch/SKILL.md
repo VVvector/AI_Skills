@@ -91,6 +91,14 @@ diff 字符串
    ├─ extract_type_names        AST → 引用的类型标识符
    └─ extract_called_functions  AST → 修改行内的函数调用名
    │
+   ▼
+[Phase 1.5: static 函数 caller 预取]  — 仅在修改文件内
+   ├─ extract_modified_static_functions  AST → 被 diff 触及的 static 函数
+   ├─ find_callers_in_file               AST → 同文件内调用该 static 函数的 callers
+   ├─ _extract_callback_args             AST → caller 传给 modified fn 的函数指针参数
+   └─ _collect_top_level_function_names  验证回调参数是否是同文件函数
+   │  （非 static 函数的 caller 跨文件、可能爆炸，仍交 LLM 按需查）
+   │
    ▼  符号集合（去重 + 不透明过滤 + 上限 50）
 [Phase 2: 全局查找]  — 跨文件定位真实定义
    ├─ git grep 批量搜索        一个 PCRE 正则匹配所有符号（避免 N 次往返）
@@ -179,6 +187,51 @@ for child in root.children:
 | `extract_called_functions`| 修改行内的函数调用名                | 递归找 `call_expression`，取 `function` 字段且为 `identifier`（跳过 `obj->method`） |
 
 **AST 作用域不可靠时的降级** — 当 diff 点向上走到 root（文件作用域）、或落在巨大的 `struct`/`union` 体内、或 `node.has_error` 为 true 时，将类型提取限制在 diff 行内，而非整个 enclosing scope。
+
+### Step 2.5 — Phase 1.5：static 函数的 caller 预取
+
+对应 `prefetch.py: extract_modified_static_functions()` + `find_callers_in_file()` + `_extract_callback_args()`。
+
+**设计动机**：`extract_called_functions` 只抓 modified fn 内部的直接调用（callee），有两个盲区：
+1. **caller 函数体** — 谁调用了被修改的函数？caller 是否容忍 modified fn 的新行为（如新增的提前 `return`、新增的锁）？
+2. **函数指针回调参数** — modified fn 接受函数指针参数（如 `build_ntf`），在内部通过指针调用。`extract_called_functions` 跳过函数指针调用，只有从 caller 侧看参数才能发现回调函数名。
+
+**为什么只对 static 函数做**：
+- `static` 函数的 caller **必然在同文件内**（C 语言可见性保证），数量天然可控
+- 非 static 函数的 caller 跨文件、可能成百上千（如 `kfree`、`mutex_lock`），预取会爆炸 → 仍交 LLM 按需查
+
+**实现**（均在同文件内，一次 AST 解析完成）：
+
+```python
+# 1. 找被 diff 触及的 static 函数
+for child in root.children:
+    if child.type == "function_definition" and has_static_storage(child):
+        if overlaps_with_diff(child, diff_ranges):
+            modified_static_fns.append(_function_name(child))
+
+# 2. 对每个 static 函数，在同文件内找 callers
+for fn in modified_static_fns:
+    for node in walk_all(tree):  # 递归遍历所有节点
+        if node.type == "call_expression" and call_target(node) == fn:
+            caller = walk_up_to_function_definition(node)  # 向上找到 caller 函数
+            callers.append((caller.start, caller.end, node.row, extract_callback_args(node)))
+
+# 3. 对每个 caller，提取传给 modified fn 的函数指针参数
+def extract_callback_args(call_node):
+    args = call_node.child_by_field_name("arguments")
+    return [arg_name for arg in arg_node.children if arg.type == "identifier"]
+    # 调用方在同文件函数表中验证这些 identifier 是否真是函数名
+```
+
+**预算控制**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MAX_CALLERS_PER_STATIC_FN` | 8 | 每个 static 函数最多抓的 caller 数 |
+| `CALLER_OVERSIZE_THRESHOLD` | 100 | caller 超过此行数则截断 |
+| `CALLER_OVERSIZE_HALF_WINDOW` | 50 | 截断时取调用点 ± 此行数 |
+
+**与 Phase 2 的关系**：caller 和回调都是同文件内的定义，直接加入 `range_map`，**不进入 Phase 2 的 git grep**（避免膨胀符号集合）。
 
 ### Step 3 — 智能过滤
 
@@ -328,6 +381,10 @@ git -C /path/to/worktree show HEAD \
 | 丢弃 `_ops` 后缀 | vtable 很大且很少是 patch 审查焦点 |
 | 200K 字符预算 | 在 LLM context window 与信息密度间取平衡 |
 | 修改文件优先渲染 | 核心上下文必须在预算截断前保留 |
+| **Phase 1.5 仅对 static 函数抓 caller** | `static` 函数 caller 必在同文件（C 可见性保证），数量可控；非 static caller 跨文件可能爆炸，交 LLM 按需查 |
+| **caller 预取含回调参数实现** | `extract_called_functions` 跳过函数指针调用（如 `build_ntf(psd, net, ctx)`），只有从 caller 侧看参数才能发现回调函数名 |
+| **caller/回调不进 Phase 2** | 同文件定义直接入 `range_map`，避免膨胀 git grep 符号集 |
+| **caller 数量上限 8 + 截断 100 行** | 防止同文件内多调用点或巨型 caller 撑爆预算 |
 
 ## 需避免的反模式
 
@@ -384,6 +441,10 @@ TARGET_KINDS = {
 | `extract_defined_names()`       | 已定义符号名 |
 | `extract_type_names()`          | 引用类型（含 scope 降级） |
 | `extract_called_functions()`    | 修改行内的函数调用 |
+| `extract_modified_static_functions()` | Phase 1.5 被 diff 触及的 static 函数 |
+| `find_callers_in_file()`        | 同文件内 static 函数的 callers + 回调参数 |
+| `_extract_callback_args()`      | caller 传给 modified fn 的函数指针参数名 |
+| `_collect_top_level_function_names()` | 同文件函数名索引（验证回调名） |
 | `find_opaque_types()`           | 不透明类型过滤 |
 | `is_noisy_tree()`               | 噪声目录过滤 |
 | `line_matches_symbol()`         | 词法边界匹配 |
