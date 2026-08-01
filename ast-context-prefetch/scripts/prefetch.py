@@ -46,6 +46,7 @@ OVERSIZE_LINE_THRESHOLD = 200         # 定义超过此行数则截断
 OVERSIZE_HALF_WINDOW = 100            # 截断时取修改点 ± 此行数
 ADJACENT_RANGE_GAP = 10               # diff 行范围合并间距
 RENDER_RANGE_GAP = 3                  # 渲染时相邻范围合并间距
+MAX_FILES_PER_SYMBOL = 3              # 跨文件同分时最多展示的文件数（预算控制）
 
 # Phase 1 目标 AST 节点类型（顶层定义）
 TARGET_KINDS = {
@@ -464,33 +465,45 @@ def score_definition_node(node, sym: str) -> int:
 
 def score_best_in_file_for_sym(
     content: str, sym: str
-) -> Optional[tuple[int, bool, int, int]]:
-    """解析文件，找到 sym 的最高分定义。
-    返回 (score, is_static, start_line, end_line)。
+) -> list[tuple[int, bool, int, int]]:
+    """解析文件，返回 sym 的所有最高分定义候选。
+
+    返回 [(score, is_static, start_line, end_line), ...]。
+    通常 1 个；#ifdef 多分支场景（如同文件内 CONFIG=y/#else 两版实现）会返回多个，
+    由调用方决定是否都展示。
+
+    设计理由：静态分析无法知道宏配置值，无法判断哪个分支是"真实实现"。
+    保留所有同分候选让 LLM 自行决策，避免评分系统替 LLM 做错误选择。
     """
     tree = _parse(content)
     best_score = 0
-    best_node = None
+    best_nodes: list = []
 
-    # 深度优先遍历所有节点
+    # 深度优先遍历所有节点，收集所有最高分候选
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
         score = score_definition_node(node, sym)
-        if score > 0 and score > best_score:
-            best_score = score
-            best_node = node
+        if score > 0:
+            if score > best_score:
+                best_score = score
+                best_nodes = [node]       # 新最高分，重置列表
+            elif score == best_score:
+                best_nodes.append(node)   # 同分，追加（保留 #ifdef 多分支）
         stack.extend(node.children)
 
-    if best_node is None or best_score == 0:
-        return None
+    if not best_nodes or best_score == 0:
+        return []
 
-    is_static = has_static_storage(best_node)
-    start = _row(best_node.start_point)
-    end = _row(best_node.end_point)
-    if end - start > OVERSIZE_LINE_THRESHOLD:
-        end = min(start + OVERSIZE_LINE_THRESHOLD, end)
-    return (best_score, is_static, start, end)
+    results = []
+    for node in best_nodes:
+        is_static = has_static_storage(node)
+        start = _row(node.start_point)
+        end = _row(node.end_point)
+        if end - start > OVERSIZE_LINE_THRESHOLD:
+            end = min(start + OVERSIZE_LINE_THRESHOLD, end)
+        results.append((best_score, is_static, start, end))
+    return results
 
 
 def _common_prefix_len(a: str, b: str) -> int:
@@ -529,12 +542,22 @@ def best_definition_range(
     hits: list[tuple[Path, int]],
     worktree_path: Path,
     caller_dirs: set[str],
-) -> Optional[tuple[Path, int, int]]:
-    """在所有候选文件中选出 sym 的最佳定义。
+) -> list[tuple[Path, int, int]]:
+    """在所有候选文件中选出 sym 的最佳定义范围列表。
+
     总分 = 定义类型分 + 接近度分。
+
+    返回 [(path, start, end), ...]：
+      - 评分不同时：只返回最高分文件内的所有候选（同文件 #ifdef 多分支都保留）
+      - 评分相同且为正分时：所有同分文件都返回（跨文件无法区分=都给 LLM）
+      - 负分文件（如 static 跨目录 -200）不入选
+
+    设计原则：评分能区分时靠评分（避免爆炸），评分不能区分时都给 LLM（保信息）。
+    预算控制：跨文件同分最多展示 MAX_FILES_PER_SYMBOL 个文件。
     """
     seen: set[Path] = set()
-    best: Optional[tuple[int, Path, int, int]] = None
+    # 收集每个文件的 (total_score, path, [(start, end), ...])
+    file_results: list[tuple[int, Path, list[tuple[int, int]]]] = []
 
     for path, _line in hits:
         if path in seen:
@@ -544,21 +567,40 @@ def best_definition_range(
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        result = score_best_in_file_for_sym(content, sym)
-        if result is None or result[0] == 0:
+        results = score_best_in_file_for_sym(content, sym)
+        if not results:
             continue
-        def_score, is_static, start, end = result
+        # 同文件内所有候选同分（由 score_best_in_file_for_sym 保证）
+        def_score = results[0][0]
+        is_static = results[0][1]
         try:
             rel_path = str(path.relative_to(worktree_path))
         except ValueError:
             rel_path = str(path)
-        score = def_score + proximity_score(rel_path, is_static, caller_dirs)
-        if best is None or score > best[0]:
-            best = (score, path, start, end)
+        prox = proximity_score(rel_path, is_static, caller_dirs)
+        total = def_score + prox
+        # 负分文件不入选（如 static 跨目录 -200，说明几乎肯定是同名重实现）
+        if total <= 0:
+            continue
+        ranges = [(r[2], r[3]) for r in results]
+        file_results.append((total, path, ranges))
 
-    if best is None:
-        return None
-    return (best[1], best[2], best[3])
+    if not file_results:
+        return []
+
+    # 找最高总分
+    max_total = max(fr[0] for fr in file_results)
+    # 所有同最高分的文件（最多 MAX_FILES_PER_SYMBOL 个，按路径字典序稳定排序）
+    best_files = [fr for fr in file_results if fr[0] == max_total]
+    best_files.sort(key=lambda x: str(x[1]))
+    best_files = best_files[:MAX_FILES_PER_SYMBOL]
+
+    # 收集所有候选范围（可能跨多个文件，每个文件可能多个候选）
+    output: list[tuple[Path, int, int]] = []
+    for _score, path, ranges in best_files:
+        for (start, end) in ranges:
+            output.append((path, start, end))
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +616,42 @@ def merge_ranges(ranges: list[tuple[int, int]], gap: int) -> list[tuple[int, int
         else:
             merged.append((start, end))
     return merged
+
+
+def _detect_preproc_anno(lines: list[str], start: int) -> Optional[str]:
+    """检查 start 行上方最近的 preproc 指令，返回条件标注。
+
+    用于在 header 中标注 #ifdef 多分支候选的条件上下文，让 LLM 知道
+    每个候选位于哪个条件分支（如 "#ifdef CONFIG_NET_NS" 或 "#else of CONFIG_NET_NS"）。
+
+    采用字符串匹配（非 AST），因为 preproc 指令在行首，不易误匹配。
+    向上最多扫描 50 行（preproc 块通常不会太大）。
+    """
+    upper = max(0, start - 50)
+    for i in range(start, upper - 1, -1):
+        if i >= len(lines):
+            continue
+        line = lines[i].strip()
+        if line.startswith("#else"):
+            # 在 #else 分支，继续向上找 #if/#ifdef 的条件
+            for j in range(i - 1, upper - 1, -1):
+                lj = lines[j].strip() if j < len(lines) else ""
+                if lj.startswith("#ifdef") or lj.startswith("#ifndef"):
+                    parts = lj.split(None, 1)
+                    cond = parts[1] if len(parts) > 1 else "?"
+                    return f"#else of {parts[0]} {cond}"
+                if lj.startswith("#if "):
+                    return f"#else of #if {lj[4:].strip()}"
+                if lj.startswith("#elif "):
+                    return f"#else/#elif chain near {lj}"
+            return "#else"
+        if line.startswith("#ifdef") or line.startswith("#ifndef"):
+            parts = line.split(None, 1)
+            cond = parts[1] if len(parts) > 1 else "?"
+            return f"{parts[0]} {cond}"
+        if line.startswith("#if "):
+            return f"#if {line[4:].strip()}"
+    return None
 
 
 def render_range_map(
@@ -628,6 +706,11 @@ def render_range_map(
             else:
                 name = "<unnamed block>"
                 header = f"--- {relative}:{start + 1} ---\n"
+
+            # 检测条件编译上下文，在 header 中标注 #ifdef 分支信息
+            anno = _detect_preproc_anno(lines, start)
+            if anno:
+                header = header.replace(" ---\n", f" [{anno}] ---\n", 1)
 
             if clamped_end >= start and start < len(lines):
                 block = "\n".join(lines[start:clamped_end + 1])
@@ -782,9 +865,7 @@ def prefetch_context_full(
         # 对每个符号选最佳定义
         for sym, (general, priority) in candidates.items():
             hits = priority + general
-            best = best_definition_range(sym, hits, worktree_path, caller_dirs)
-            if best is not None:
-                path, start, end = best
+            for path, start, end in best_definition_range(sym, hits, worktree_path, caller_dirs):
                 range_map[path].add((start, end))
 
     # ---- 渲染输出 ----
