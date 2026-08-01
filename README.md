@@ -4,42 +4,14 @@
 
 ## Skill 列表
 
-| Skill | 说明 | 提供的能力 | 入口 |
-|-------|------|------------|------|
-| [git-toolbox](./git-toolbox/SKILL.md) | 封装 git-toolbox 脚本工具集，提供 Git 仓库查询、差异对比、文件搜索、blame 追溯等能力。当用户需要查看 commit、diff、grep、文件列表或追溯代码修改时调用。 | `git_log`、`git_show`、`git_diff`、`git_ls`、`git_find_files`、`git_grep`、`git_read_files`、`git_blame` | [git-toolbox/SKILL.md](./git-toolbox/SKILL.md) |
-
-## 目录结构
-
-```
-AI_Skills/
-├── README.md
-├── .gitignore
-└── git-toolbox/
-    ├── SKILL.md            # Skill 声明文件（Agent 读取的入口）
-    └── scripts/            # Skill 自带脚本资源
-        ├── cli.py          # CLI 入口，直接调用各工具
-        ├── toolbox.py      # ToolBox 调度核心
-        ├── context.py      # 多 repo 上下文管理
-        ├── framework.py    # 工具注册框架
-        ├── truncator.py    # 输出截断控制
-        ├── utils.py        # 通用工具函数
-        ├── git_log.py      # 各工具实现
-        ├── git_show.py
-        ├── git_diff.py
-        ├── git_ls.py
-        ├── git_find_files.py
-        ├── git_grep.py
-        ├── git_read_files.py
-        ├── git_blame.py
-        ├── read_prompt.py
-        └── tests/          # 单元测试
-            ├── __init__.py
-            └── test_toolbox.py
-```
+| Skill | 简介 |
+|-------|------|
+| [git-toolbox](./git-toolbox/SKILL.md) | 封装 git-toolbox 脚本工具集，提供 Git 仓库查询、差异对比、文件搜索、blame 追溯等能力。当用户需要查看 commit、diff、grep、文件列表或追溯代码修改时调用。 |
+| [ast-context-prefetch](./ast-context-prefetch/SKILL.md) | 基于 AST/tree-sitter 的动态 context 预取，用于 LLM 代码审查（diff → AST 符号提取 → git grep → 评分渲染）。在构建 patch 审查的 prefetch_context 或移植 sashiko 预取流水线时调用。 |
 
 ## 使用方式
 
-### 1. 在 Trae IDE 中启用
+### 在 Trae IDE 中启用
 
 将目标 Skill 目录复制（或软链）到项目的 `.trae/skills/` 下：
 
@@ -54,25 +26,6 @@ Copy-Item -Recurse "d:\AI\AI_Skills\git-toolbox" "<your-project>\.trae\skills\gi
 ```
 
 Agent 在对话中会根据 `SKILL.md` 的 `description` 自动判断是否调用。
-
-### 2. git-toolbox 调用示例
-
-该 Skill 通过自带 Python 脚本直接调用（无需 MCP 服务器），参数以 JSON 经 stdin 传入：
-
-```powershell
-# 查看最新提交
-'{"range":"HEAD","limit":3}' | python "<skill-dir>/scripts/cli.py" git_log --repo "D:\your\repo"
-
-# 搜索代码
-'{"revision":"HEAD","pattern":"start_kernel","path":"init/main.c","is_literal":true}' | python "<skill-dir>/scripts/cli.py" git_grep --repo "D:\your\repo"
-
-# 对比两个版本
-'{"base_revision":"v1.0","target_revision":"v1.1","paths":["Makefile"]}' | python "<skill-dir>/scripts/cli.py" git_diff --repo "D:\your\repo"
-```
-
-输出为结构化 JSON（含 `content` / `metadata` / `error` 等字段）。
-
-> 环境要求：本机 `python` 命令可用（已在 Python 3.14 验证）。
 
 ## 约定
 
