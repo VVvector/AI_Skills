@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from git_toolbox_mcp.toolbox import (
+from scripts import (
     ToolBox,
     Truncator,
     GitToolContext,
