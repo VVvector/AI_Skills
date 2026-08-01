@@ -7,7 +7,7 @@
 | Skill | 简介 |
 |-------|------|
 | [git-toolbox](./git-toolbox/SKILL.md) | 封装 git-toolbox 脚本工具集，提供 Git 仓库查询、差异对比、文件搜索、blame 追溯等能力。当用户需要查看 commit、diff、grep、文件列表或追溯代码修改时调用。 |
-| [ast-context-prefetch](./ast-context-prefetch/SKILL.md) | 基于 AST/tree-sitter 的动态 context 预取，用于 LLM 代码审查（diff → AST 符号提取 → git grep → 评分渲染）。在构建 patch 审查的 prefetch_context 或移植 sashiko 预取流水线时调用。 |
+| [ast-context-prefetch](./ast-context-prefetch/SKILL.md) | 基于 AST/tree-sitter 的动态 context 预取，用于 LLM 代码审查（diff → AST 符号提取 → git grep → 评分渲染）。在构建 patch 审查的 prefetch_context 或移植预取流水线时调用。 |
 
 ## 使用方式
 

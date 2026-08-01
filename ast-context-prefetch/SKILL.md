@@ -1,6 +1,6 @@
 ---
 name: "ast-context-prefetch"
-description: "基于 AST/tree-sitter 的动态 context 预取，用于 LLM 代码审查（diff → AST 符号提取 → git grep → 评分渲染）。在构建 patch 审查的 prefetch_context 或移植 sashiko 预取流水线时调用。"
+description: "基于 AST/tree-sitter 的动态 context 预取，用于 LLM 代码审查（diff → AST 符号提取 → git grep → 评分渲染）。在构建 patch 审查的 prefetch_context 或移植预取流水线时调用。"
 ---
 
 # AST Context 预取
